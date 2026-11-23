@@ -13,9 +13,13 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
+from private_voice_sync import export, push, status_doc
+from voice_research import reports
+
 CHINA = timezone(timedelta(hours=8))
 BILI = "https://space.bilibili.com/2137589551/video"
 VIDEO = "https://www.bilibili.com/video/"
+PYTHON = Path(sys.executable).with_name("python.exe")
 
 
 def command(args, timeout=180, env=None):
@@ -110,12 +114,13 @@ def process(tool_root, root, video, downloader):
         if abs(audio_duration - duration) > max(2, duration * 0.02):
             raise RuntimeError(f"时长不符，音频 {audio_duration:.2f} 秒，平台 {duration} 秒")
         result = command(
-            [sys.executable, "-X", "utf8", __file__, "--worker", tool_root, media], timeout=1800
+            [PYTHON, "-X", "utf8", __file__, "--worker", tool_root, media], timeout=1800
         )
         cues = json.loads(result)
     if not cues:
         raise RuntimeError("未识别出语音")
     tail = max(0, round(audio_duration - cues[-1][1] / 1000, 1))
+    covered = sum(end - start for start, end, _ in cues) / 1000
     date = datetime.fromtimestamp(published, CHINA)
     rel = f"{date:%Y-%m-%d}/{video['platform']}-{video['id']}.md"
     lines = [
@@ -123,7 +128,9 @@ def process(tool_root, root, video, downloader):
         f"- 来源 {video['url']}", f"- 时长 {duration} 秒",
         f"- 完成 {datetime.now(CHINA).isoformat(timespec='seconds')}",
         "- 模型 SenseVoice Small INT8 CPU + Silero VAD",
+        "- 状态 已转写，待听审",
         f"- 完整性 音频时长 {audio_duration:.2f} 秒，末段识别后 {tail} 秒无转写，片尾待听审",
+        f"- 时间戳覆盖 {covered:.1f} 秒（包括自然停顿差异，不代表讲话完整率）",
         "- 待核对 数字、股票名称、指数、金额和日期均保留机器识别原文", "",
         "## 中文讲话", "",
     ]
@@ -137,14 +144,16 @@ def process(tool_root, root, video, downloader):
 def poll(tool_root, root, videos, downloader, explicit, scan_limit):
     urls = list(explicit)
     failure = ""
+    entries = {}
     try:
         result = command([*downloader, "--flat-playlist", "--playlist-end", scan_limit,
                           "--dump-single-json", "--", BILI])
-        for item in json.loads(result)["entries"]:
-            if item and re.fullmatch(r"BV[0-9A-Za-z]{10}", item["id"]):
-                urls.append(VIDEO + item["id"])
+        entries = {item["id"]: item for item in json.loads(result)["entries"] or []
+                   if item and re.fullmatch(r"BV[0-9A-Za-z]{10}", item.get("id") or "")}
+        urls.extend(VIDEO + ident for ident in entries)
         if len(urls) == len(explicit):
             raise RuntimeError("账号列表未返回视频")
+        logging.info("B站发现成功，返回 %d 个视频", len(entries))
     except (RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
         failure = str(exc).splitlines()[0]
         logging.warning("B站发现失败 %s", failure)
@@ -154,10 +163,14 @@ def poll(tool_root, root, videos, downloader, explicit, scan_limit):
             raise ValueError("仅接受规范的 B站或抖音单视频链接")
         ident = url.rsplit("/", 1)[-1]
         platform = "bilibili" if "bilibili.com" in url else "douyin"
-        videos.setdefault(f"{platform}:{ident}", dict(
+        record = videos.setdefault(f"{platform}:{ident}", dict(
             id=ident, url=url, platform=platform, title=ident, status="待转写",
             observed=time.time(), attempts=0, retry_after=0,
         ))
+        item = entries.get(ident, {})
+        for field, key in (("title", "title"), ("timestamp", "published"), ("duration", "duration")):
+            if item.get(field) and (key == "title" and record["title"] == ident or not record.get(key)):
+                record[key] = item[field]
 
     def persist():
         write(root / "state.json", json.dumps(videos, ensure_ascii=False, indent=2) + "\n")
@@ -165,7 +178,8 @@ def poll(tool_root, root, videos, downloader, explicit, scan_limit):
 
     persist()
     for video in videos.values():
-        if video.get("transcript") or video["retry_after"] > time.time() or (root / "pause").exists():
+        if (video.get("transcript") or video.get("access_blocked")
+                or video["retry_after"] > time.time() or (root / "pause").exists()):
             continue
         try:
             process(tool_root, root, video, downloader)
@@ -174,8 +188,26 @@ def poll(tool_root, root, videos, downloader, explicit, scan_limit):
             video["attempts"] += 1
             video["retry_after"] = time.time() + min(21600, 900 * 2 ** min(video["attempts"] - 1, 5))
             video["status"] = "转写失败，等待重试"
+            if video["platform"] == "douyin" and re.search(r"\b403\b|fresh cookies", str(exc), re.I):
+                video.update(status="抖音拒绝媒体访问，暂停自动重试", access_blocked=True)
             logging.warning("%s %s", video["id"], str(exc).splitlines()[0])
         persist()
+    return failure
+
+
+def refresh_private(root, videos, failure, gh, repo):
+    status_path = root / "status.json"
+    previous = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+    last_ok = previous.get("last_successful_feed_check")
+    if not failure:
+        last_ok = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    status = status_doc(videos, failure, last_ok)
+    write(status_path, json.dumps(status, ensure_ascii=False, indent=2) + "\n")
+    for path, content in reports(root, videos):
+        write(root / path, content)
+    if gh:
+        commit = push(gh, repo, export(root, (root / "index.md").read_text(encoding="utf-8"), status))
+        logging.info("私有 GitHub 归档成功 %s", commit)
 
 
 def main():
@@ -185,6 +217,8 @@ def main():
     parser.add_argument("--interval", type=int, default=15)
     parser.add_argument("--scan-limit", type=int, default=30)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--github-cli", type=Path)
+    parser.add_argument("--private-repo")
     parser.add_argument("--url", action="append", default=[])
     parser.add_argument("--worker", nargs=2, type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -193,6 +227,8 @@ def main():
         return
     if not args.tool_root or not args.archive or args.interval < 15 or args.scan_limit < 1:
         parser.error("需要 --tool-root、--archive，间隔至少 15 分钟，扫描数量大于零")
+    if bool(args.github_cli) != bool(args.private_repo):
+        parser.error("--github-cli 与 --private-repo 必须一起设置")
     root = args.archive.resolve()
     checkout = Path(__file__).resolve().parent
     if root.is_relative_to(checkout) or any((parent / ".git").exists() for parent in (root, *root.parents)):
@@ -203,7 +239,7 @@ def main():
     os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (
         str(args.tool_root.resolve() / "deps"), os.environ.get("PYTHONPATH"),
     )))
-    downloader = [sys.executable, "-X", "utf8", "-m", "yt_dlp", "--ignore-config", "--no-progress",
+    downloader = [PYTHON, "-X", "utf8", "-m", "yt_dlp", "--ignore-config", "--no-progress",
                   "--no-colors", "--socket-timeout", "20", "--retries", "1"]
     with (root / "voice.lock").open("a+b") as lock:
         lock.seek(0)
@@ -215,11 +251,17 @@ def main():
         videos = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}
         while True:
             if not (root / "pause").exists():
-                poll(args.tool_root.resolve(), root, videos, downloader, args.url, args.scan_limit)
+                try:
+                    failure = poll(args.tool_root.resolve(), root, videos, downloader, args.url, args.scan_limit)
+                    refresh_private(root, videos, failure, args.github_cli, args.private_repo)
+                except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+                    logging.error("归档或私有同步失败，下轮重试: %s", str(exc).splitlines()[0])
+                    if args.once:
+                        return 1
             if args.once:
                 break
             time.sleep(args.interval * 60)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

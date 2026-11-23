@@ -331,3 +331,18 @@ python voice_monitor.py --tool-root D:/Tools/BiliPrep --archive D:/LiDaxiaoPriva
 不会以标题补写讲话。语音转写使用独立子进程，完成后释放资源。完整音轨时长校验
 与片尾待听审状态会随文字稿保存。完整文字稿不进入公开仓库。私有存储同步、
 ChatGPT 读取、字幕优先、实时回环及基于语音的自动研究报告仍需接入。
+
+### 私有同步与 Windows 托盘
+
+可选参数 `--github-cli PATH --private-repo OWNER/NAME` 启用全文同步。
+先在 GitHub CLI 配好有写权限的账号，并创建带初始提交的私有仓库。
+每次同步前重新检查目标可见性。失败时保留本地全文，并在下一监控轮次重试。
+仓库仅接收文字稿、研究报告、索引及状态，不接收视频、缓存、日志或账号数据。
+
+- `docs/status/latest.json` 区分发现端错误、最新已知发布日期、待处理与可读文字稿。
+- `docs/transcripts/latest.md` 是最新一篇已生成的转写全文。
+- `docs/transcripts/index.md` 是历史索引。
+- `docs/research/YYYY-MM-DD.md` 是带时间戳的主题摘录及待核数据。
+
+在有交互桌面的 Windows PowerShell 中运行 `scripts/voice_tray.ps1 -Archive D:/LiDaxiaoPrivate`
+可查看状态和日志，或暂停和恢复本地监控。抖音拒绝媒体访问时，该条目暂停自动重试。
