@@ -1,4 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$Archive)
+﻿param([Parameter(Mandatory = $true)][string]$Archive)
+$mutex = [System.Threading.Mutex]::new($false, 'Local\LiDaxiaoVoiceTray')
+try { $acquired = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+if (!$acquired) { $mutex.Dispose(); exit }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $icon = New-Object System.Windows.Forms.NotifyIcon
@@ -32,4 +35,6 @@ try {
     $icon.Visible = $false
     $icon.Dispose()
     $menu.Dispose()
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
 }
